@@ -48,8 +48,10 @@ final class DBFKitTests: XCTestCase {
             try dbfTable.addColumn(with: "something", dataType: .STRING, count: 2)
             try dbfTable.addColumn(with: "anotherCol", dataType: .STRING, count: 4)
             dbfTable.lockColumnAdding()
-            try dbfTable.addRow(with: ["gg", "gg"]) // we test for row adding when it matches up to full col length and when it doesn't
-            
+
+            for _ in 0 ..< 512 {
+              try dbfTable.addRow(with: ["gg", "gg"]) // we test for row adding when it matches up to full col length and when it doesn't
+            }
             // init writer
             let writer: DBFWriter = DBFWriter(dbfTable: dbfTable)
             
@@ -59,7 +61,9 @@ final class DBFKitTests: XCTestCase {
             // we can now use our reader to confirm that the result succeeded
             let reader: DBFFile = DBFFile(path: Bundle(for: type(of: self)).path(forResource: "writeme", ofType: "dbf")!)
             try reader.read()
-            
+
+            XCTAssertEqual(512, reader.getNumRecords())
+            XCTAssertEqual(512, reader.getDBFTable().getTotalRecordCount())
             XCTAssertTrue(reader.getDBFTable().getColumns().count == 2)
             XCTAssertTrue(reader.getDBFTable().getRows()[0][0] == "gg")
         } catch {
@@ -87,7 +91,8 @@ final class DBFKitTests: XCTestCase {
             
             try dbfTable.addRow(with: ["gg", "1", "gg"])
             try dbfTable.addRow(with: ["rg", "2", "rg"])
-            
+            try dbfTable.addRow(with: ["Å", "3", "ab"])
+
             let writer: DBFWriter = DBFWriter(dbfTable: dbfTable)
             
             try writer.write(to: Bundle(for: type(of: self)).url(forResource: "writeme", withExtension: "dbf")!)
@@ -97,7 +102,9 @@ final class DBFKitTests: XCTestCase {
             try reader.read()
             
             XCTAssertTrue(reader.getDBFTable().getColumns().count == 3)
-            XCTAssertTrue(reader.getNumRecords() == 2)
+            XCTAssertTrue(reader.getNumRecords() == 3)
+            XCTAssertEqual(reader.getDBFTable().getRows()[2][0], "Å")
+
         } catch {
             print("\(error)")
             XCTAssertTrue(false)
@@ -174,7 +181,7 @@ final class DBFKitTests: XCTestCase {
             XCTAssertTrue(reader.getDBFTable().getRows()[1][2] == "30")
             
             // for asserting doubles
-            XCTAssertTrue(reader.getDBFTable().getRows()[0][4] == "4.5")
+            XCTAssertEqual(reader.getDBFTable().getRows()[0][4], "4.5")
         } catch {
             print("\(error)")
             success = false
@@ -228,8 +235,8 @@ final class DBFKitTests: XCTestCase {
             try reader.read()
             
             XCTAssertTrue(reader.getNumRecords() == 1)
-            XCTAssertTrue(reader.getDBFTable().getRows()[0][1] == dbf_table.getRows()[0][1])
-            
+            XCTAssertEqual(reader.getDBFTable().getRows()[0][1], dbf_table.getRows()[0][1])
+
             // now test convert out
             let date_check: Date = DBFTable.convertTimestampToDate(timestamp: reader.getDBFTable().getRows()[0][1])!
             

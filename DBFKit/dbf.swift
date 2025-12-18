@@ -718,7 +718,7 @@ class DBFWriter {
      * - Version: 1.2
      * - Since: 1.1
      */
-    private func writeBytesRecord(buffer: UnsafeMutablePointer<Data>, record: [String], current_offset: UnsafeMutablePointer<Int>) throws {
+    private func writeBytesRecord(buffer: UnsafeMutablePointer<Data>, record: [String], current_offset: UnsafeMutablePointer<Int>, encoding: String.Encoding) throws {
         // this function already assumes that the record was already marked with an '*' or ' '
         // all text should also be in ascii
         var zi: Int = 0
@@ -850,27 +850,27 @@ class DBFWriter {
                 continue
             } else {
                 // make sure z is not larger than the max length allowed for the column
-                if z.count > self.dbfTable.getColumns()[zi].count {
+                guard var converted: Data = z.data(using: encoding) else {
+                    throw DBFError.ROW_ADD_ERR("Row at index \(zi), element \(z) cannot be converted to selected encoding")
+                }
+                let col = self.dbfTable.getColumns()[zi]
+                if converted.count > col.count {
                     throw DBFError.ROW_ADD_ERR("Row at index \(zi), element \(z) exceeds the maximum length for column")
                 }
-                for j in z {
-                    // should be 16 bit
-                    buffer.pointee.withUnsafeMutableBytes { (bytess: UnsafeMutableRawBufferPointer) in
-                        bytess.storeBytes(of: UInt16(j.asciiValue!), toByteOffset: current_offset.pointee, as: UInt16.self)
-                    }
-                    current_offset.pointee += 1
+
+                // Pad with zeroes
+                if converted.count < col.count {
+                    let extraData = Array(repeating: UInt8(0), count: col.count - converted.count)
+                    converted.append(contentsOf: extraData)
+                }
+
+                for j in 0 ..< converted.count {
+                   let byte = converted[j]
+                   buffer.pointee[current_offset.pointee] = byte
+                   current_offset.pointee += 1
                 }
             }
-            // add spaces until we reach the max length for col
-            let space_add: Int = self.dbfTable.getColumns()[zi].count - z.count
-            var zzi: Int = 0
-            while zzi < space_add {
-                buffer.pointee.withUnsafeMutableBytes { (bytes: UnsafeMutableRawBufferPointer) in
-                    bytes.storeBytes(of: UInt16(0x0000), toByteOffset: current_offset.pointee, as: UInt16.self)
-                }
-                current_offset.pointee += 1
-                zzi += 1
-            }
+
             zi += 1
         }
     }
@@ -882,7 +882,7 @@ class DBFWriter {
      * - Version: 1.2
      * - Since: 1.0
      */
-    private func writeBytes() throws -> Data {
+    private func writeBytes(encoding: String.Encoding) throws -> Data {
         // reset dbt info as needed
         self.deinitDBT()
         let header_len: Int = self.dbfTable.getTotalBytesHeader()
@@ -949,18 +949,21 @@ class DBFWriter {
         current_offset += 1
 //        buffer[current_offset + 1] = 0x0020
 //        current_offset += 2
+        assert(current_offset == header_len)
+        var iter = 0
         for i in self.dbfTable.getRows() {
             // add space to mark row present
             buffer[current_offset] = 0x0020
             current_offset += 1
-            try self.writeBytesRecord(buffer: &buffer, record: i, current_offset: &current_offset)
+            try self.writeBytesRecord(buffer: &buffer, record: i, current_offset: &current_offset, encoding: encoding)
+            iter += 1
         }
         // add any deleted rows
         for i in self.dbfTable.getDeletedRows() {
             // deleted rows are marked with an '*'
             buffer[current_offset] = 0x2A
             current_offset += 1
-            try self.writeBytesRecord(buffer: &buffer, record: i, current_offset: &current_offset)
+            try self.writeBytesRecord(buffer: &buffer, record: i, current_offset: &current_offset, encoding: encoding)
         }
         // eof flag
         buffer[current_offset] = 0x1A
@@ -982,9 +985,9 @@ class DBFWriter {
      * - Version: 1.0
      * - Since: 1.0
      */
-    public func write(to file: URL) throws {
+    public func write(to file: URL, encoding: String.Encoding = .utf8) throws {
         // get bytes
-        let buffer: Data = try self.writeBytes()
+        let buffer: Data = try self.writeBytes(encoding: encoding)
         // write to url
         try buffer.write(to: file)
     }
@@ -1139,7 +1142,7 @@ class DBFFile {
      * - Version: 1.2
      * - Since: 1.0
      */
-    public func read() throws {
+    public func read(encoding: String.Encoding = String.Encoding.utf8) throws {
         // make sure we have a valid path given
         if self.filePath == nil {
             throw DBFError.READ_ERROR("Cannot read DBF file because path is nil")
@@ -1169,7 +1172,10 @@ class DBFFile {
         self.lastUpdate = Calendar(identifier: .gregorian).date(from: dateComp)
         
         // next should be number of records
-        let rec: Int = Int(buffer[4])
+        let rec_size_data = buffer.subdata(in: 4..<8)
+        let rec = rec_size_data.withUnsafeBytes { ptr in
+          return Int(ptr.load(as: UInt32.self))
+        }
         self.numRecords = rec
         
         // byte 14 should be a flag for incomplete transaction
@@ -1188,12 +1194,15 @@ class DBFFile {
         }
         self.is_encrypted = enc == 1
         
-        // use byte 10 for future comparison
-        let one_record_bytes: Int = Int(buffer[10])
-        
+        // use byte 10 and 11 for future comparison
+        let one_record_bytes_data = buffer.subdata(in: 10..<12)
+        let one_record_bytes = one_record_bytes_data.withUnsafeBytes { ptr in
+          return Int(ptr.load(as: UInt16.self))
+        }
+
         // it is perfectly safe to skip to byte 32 where the col info begins
         // keep on collecting col info until the terminator is reached
-        var current_byte: Int = 32
+        var current_byte: Data.Index = 32
         var bytec: Int = 32
         var expected_record_count: Int = 1
         while buffer[current_byte] != 0x0D {
@@ -1235,113 +1244,106 @@ class DBFFile {
         self.dbfTable.lockColumnAdding()
         // terminator reached, read records
         current_byte += 1
-//        current_byte += 2
-        var collect: String = "" // for storing data we pick up
-        var bytes_collect: [UInt8] = [] // for picking up data with type long/autoincrement
-        var values_collected: [String] = [] // for storing our collected values
-        var col_index: Int = 0 // for storing what index of the column we are at
+
         var record_deleted: Bool = false
-        
+
         // make sure that the last byte is the eof marker
         if buffer[buffer.count - 1] != 0x1A {
             throw DBFError.READ_ERROR("EOF marker not found!")
         }
-        
-        while buffer[current_byte] != 0x1A {
-            if values_collected.count == 0 && collect.count == 0 && buffer[current_byte] == 0x2A {
-                // record deleted
-                record_deleted = true
-                current_byte += 1
-            } else if values_collected.count == 0 && collect.count == 0 && buffer[current_byte] == 0x0020 {
-                // record not deleted
-                current_byte += 1
-            } else if values_collected.count == 0 && collect.count == 0 {
-                // strange character
-                throw DBFError.READ_ERROR("Can't assert if the record is deleted")
-            }
-            // check if the col is of type long or autoincrement
-            if self.dbfTable.getColumns()[col_index].columnType == .LONG || self.dbfTable.getColumns()[col_index].columnType == .AUTOINCREMENT {
-                // the following was adapted from to convert [UInt8] to Int: https://stackoverflow.com/questions/32769929/convert-bytes-uint8-array-to-int-in-swift
-                // we only have to record 4 bytes
-                bytes_collect = [buffer[current_byte], buffer[current_byte + 1], buffer[current_byte + 2], buffer[current_byte + 3]]
-                
-                // shift byte count
-                current_byte += 4
-                // now convert to int
-                let data_value: NSData = NSData(bytes: bytes_collect, length: 4)
-                var data_v: UInt32 = 0
-                data_value.getBytes(&data_v, length: 4)
-//                data_v = UInt32(bigEndian: data_v)
-                data_v = UInt32(data_v)
-                collect = String(Int(data_v))
-            } else if self.dbfTable.getColumns()[col_index].columnType == .DOUBLE {
-                bytes_collect = [buffer[current_byte], buffer[current_byte + 1], buffer[current_byte + 2], buffer[current_byte + 3], buffer[current_byte + 4], buffer[current_byte + 5], buffer[current_byte + 6], buffer[current_byte + 7]]
-                
-                // the following was adapted from: https://stackoverflow.com/questions/31773367/convert-byte-array-to-double-in-swift
-                
-                // shift byte count
-                current_byte += 8
-                // now convert to double
-                let d: Double = bytes_collect.withUnsafeBytes {
-                    $0.load(fromByteOffset: 0, as: Double.self)
-                }
-                
-                collect = String(d)
-            } else if self.dbfTable.getColumns()[col_index].columnType == .TIMESTAMP {
-                // pick up 8 bytes of data
-                bytes_collect = [buffer[current_byte], buffer[current_byte + 1], buffer[current_byte + 2], buffer[current_byte + 3], buffer[current_byte + 4], buffer[current_byte + 5], buffer[current_byte + 6], buffer[current_byte + 7]]
-                
-                current_byte += 8
-                
-                // first 4 bytes is number of days
-                // first half and second half are actually integers
-                let pt1: [UInt8] = [bytes_collect[0], bytes_collect[1], bytes_collect[2], bytes_collect[3]]
-                let pt2: [UInt8] = [bytes_collect[4], bytes_collect[5], bytes_collect[6], bytes_collect[7]]
-                
-                let data_value1: NSData = NSData(bytes: pt1, length: 4)
-                var data_v1: UInt32 = 0
-                data_value1.getBytes(&data_v1, length: 4)
-                data_v1 = UInt32(data_v1)
-                collect = String(Int(data_v1)) + " "
-                
-                // now do time
-                let data_value2: NSData = NSData(bytes: pt2, length: 4)
-                var data_v2: UInt32 = 0
-                data_value2.getBytes(&data_v2, length: 4)
-                data_v2 = UInt32(data_v2)
-                collect += String(Int(data_v2))
-            } else {
-                // collect values as we pick them up
-                collect += String(UnicodeScalar(buffer[current_byte]))
-                current_byte += 1
-            }
-            // check if collect has touched max length
-            if collect.count == self.dbfTable.getColumns()[col_index].count || bytes_collect.count > 0 {
-                // touched
-                // clear bytes collect
-                bytes_collect = []
-                values_collected.append(collect)
-                collect = ""
-                col_index += 1
-                // make sure col index is still valid
-                if col_index >= self.dbfTable.getColumns().count {
-                    // add row
-                    try self.dbfTable.addRow(with: values_collected, deleted: record_deleted)
-                    record_deleted = false // reset as necessary
-                    // if we have reached the record count, break out of the loop
-                    if self.dbfTable.getRows().count == rec {
-                        break
-                    }
-                    col_index = 0 // reset col index
-                    // expect eof marker
-                    if current_byte >= buffer.count {
-                        break
-                    }
-                    // reset values collected
-                    values_collected = []
-                }
-            }
+
+        var rowSize = 1 // To include record delete / valid marker
+        for col in self.dbfTable.getColumns() {
+          rowSize += col.count
         }
+        if (buffer.count - 1 - current_byte) % rowSize != 0 {
+          throw DBFError.READ_ERROR("EOF marker is at an unexpected offset!")
+        }
+
+        while buffer[current_byte] != 0x1A {
+
+          let recordData = buffer.subdata(in: current_byte ..< current_byte + rowSize)
+          current_byte += rowSize
+
+          var dataColumns: [Data] = []
+          if (recordData[0] == 0x2A) {
+            record_deleted = true
+          } else if (recordData[0] == 0x20) {
+            record_deleted = false
+          } else {
+            throw DBFError.READ_ERROR("Can't assert if the record is deleted")
+          }
+
+          var rowOffset = 1 // Skipping the record start marker
+          for col in self.dbfTable.getColumns()  {
+            dataColumns += [recordData.subdata(in: rowOffset ..< rowOffset + col.count)]
+            rowOffset += col.count
+          }
+
+          var row: [String] = []
+          for (col, data) in zip(self.dbfTable.getColumns(), dataColumns ){
+            switch col.columnType {
+            case .AUTOINCREMENT:
+              fallthrough
+            case .LONG:
+              // the following was adapted from to convert [UInt8] to Int: https://stackoverflow.com/questions/32769929/convert-bytes-uint8-array-to-int-in-swift
+              // we only have to record 4 bytes
+              // now convert to int
+              let value = data.withUnsafeBytes { ptr in
+                return Int(ptr.load(as: UInt32.self))
+              }
+              row += [String(value)]
+            case .DOUBLE:
+              // the following was adapted from: https://stackoverflow.com/questions/31773367/convert-byte-array-to-double-in-swift
+              let value = data.withUnsafeBytes { ptr in
+                return Double(ptr.load(as: Double.self))
+              }
+              row += [String(value)]
+            case .TIMESTAMP:
+              // From https://www.dbase.com/Knowledgebase/INT/db7_file_fmt.htm
+              // we can deduce it as follows:
+              //   - Each timestamp is 8 bytes, containing two 'longs'
+              //     (32 bit values) of unspecified endianess
+              //   - The first integer is the date
+              //   - The second is for the time specified as:
+              //      hours * 3600000L + minutes * 60000L + Seconds * 1000L
+              // That means that the time is milliseconds, covering a day,
+              // without leap seconds (same behaviour as UNIX time).
+              //
+              // However, JDN starts with the day fraction being 0 at noon.
+              // According to the documentation days is number of days
+              // since 01/01/4713 BC, which coincide with the Julian period,
+              // in the proleptic Julian(!!!) calendar.
+              // However documentation does not state which calendar
+              // the timestamps are referring to, and this matters since in the
+              // proleptic Gregorian calendar the Julian period starts at
+              // November 24, 4714 BC.
+              // Note that this does not impact this reader which returns
+              // a space separated string,
+
+              let dayData = data.subdata(in: 0 ..< 4)
+              let timeData = data.subdata(in: 4 ..< 8)
+
+              let dayValue = dayData.withUnsafeBytes { ptr in
+                return Int(ptr.load(as: UInt32.self))
+              }
+              let timeValue = timeData.withUnsafeBytes { ptr in
+                return Int(ptr.load(as: UInt32.self))
+              }
+
+              row += ["\(dayValue) \(timeValue)"]
+              break;
+            default:
+              guard let str = String(data: data, encoding: encoding) else {
+                throw DBFError.READ_ERROR("Can't decode string")
+              }
+              row += [str]
+            }
+          }
+
+          try self.dbfTable.addRow(with: row, deleted: record_deleted)
+        }
+      
         // we read all data by this point
     }
     /**
